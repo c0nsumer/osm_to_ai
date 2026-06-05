@@ -25,7 +25,7 @@ python osm_to_ai.py --bbox=-83.126807,42.711193,-83.096595,42.734788 --fetch-dem
 - **Utilities** — power lines and tower icons in a dedicated layer
 - **Information nodes** — `tourism=information` nodes rendered as symbols: guideposts with a labelled triangle, map boards with a blue "i" marker
 - **Amenity nodes** — drinking water, bicycle repair stands, toilets, and parking rendered as distinct icons
-- **Hillshade** — generate a hillshade layer from a local GeoTIFF DEM, or download one automatically from the USGS 3DEP service
+- **Hillshade** — generate a hillshade layer from a local GeoTIFF DEM, or download one automatically from the USGS 3DEP service. The relief is rendered as a transparent overlay that tints only slopes with shadows and highlights (matching the interactive map-generator look), so flat ground shows through instead of being washed out by a gray sheet
 - **Overpass retry logic** — automatically retries on 429/504 errors with exponential backoff
 - **No GIS software required** — pure Python, no GDAL command-line tools needed (rasterio handles projection internally)
 
@@ -113,6 +113,16 @@ python osm_to_ai.py --bbox="-105.28,40.01,-105.25,40.03" --fetch-dem --output ma
 
 The downloaded DEM is saved as a sidecar `.tif` file next to the output (e.g. `map_dem.tif`) and reused on subsequent runs.
 
+### Tuning the hillshade
+
+The relief defaults to an illumination direction of 315° (northwest) and an exaggeration of `0.4`, matching the interactive map-generator look. Override either to taste — for example, light the terrain from the west (270°) with stronger relief:
+
+```
+python osm_to_ai.py --file input.osm --fetch-dem --sun-azimuth 270 --hillshade-exaggeration 0.6 --output map.svg
+```
+
+Lower the exaggeration (e.g. `0.2`) for a subtler effect, or raise it toward `1.0` to make slopes stand out more.
+
 ## All options
 
 | Option | Default | Description |
@@ -125,8 +135,8 @@ The downloaded DEM is saved as a sidecar `.tif` file next to the output (e.g. `m
 | `--dem PATH` | — | Local GeoTIFF DEM for hillshade |
 | `--fetch-dem` | — | Download a DEM from USGS 3DEP automatically |
 | `--dem-resolution METERS` | `3` | DEM pixel size in metres (`1` = lidar, `3` = 1/9″, `10` = 1/3″) |
-| `--sun-azimuth DEGREES` | `315` | Sun direction, clockwise from north (315 = northwest) |
-| `--sun-altitude DEGREES` | `45` | Sun angle above the horizon |
+| `--sun-azimuth DEGREES` | `315` | Illumination direction, clockwise from north (315 = northwest) |
+| `--hillshade-exaggeration FACTOR` | `0.4` | Hillshade exaggeration/intensity, `0`–`1` (higher = stronger relief) |
 | `--save-osm PATH` | — | Save the downloaded OSM XML to a file for later reuse with `--file` |
 
 ## Trail coloring
