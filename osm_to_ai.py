@@ -175,9 +175,13 @@ def fetch_overpass(query, retries=4, backoff_seconds=(10, 30, 60, 120)):
     """POST to Overpass API with exponential-ish backoff on 429/504 errors."""
     if requests is None:
         sys.exit("ERROR: 'requests' library not installed. Run: pip install requests")
+    headers = {
+        'Accept': 'application/osm3s+xml,*/*;q=0.9',
+        'User-Agent': 'osm-to-ai/1.0 (map rendering tool)'
+    }
     for attempt in range(retries + 1):
         try:
-            resp = requests.post(OVERPASS_URL, data={'data': query}, timeout=90)
+            resp = requests.post(OVERPASS_URL, data={'data': query}, timeout=90, headers=headers)
             resp.raise_for_status()
             return resp.text
         except requests.exceptions.HTTPError as e:
@@ -266,36 +270,91 @@ def fetch_usgs_dem(min_lon, min_lat, max_lon, max_lat, out_path, res_m=DEFAULT_D
 # Hillshade from a local DEM GeoTIFF (Option C)
 # ---------------------------------------------------------------------------
 
-def _compute_hillshade(elevation, res_x, res_y, azimuth=315, altitude=45, z_factor=1.0):
+def _hex_to_rgb01(color):
+    """'#rrggbb' (or '#rgb') -> (r, g, b) floats in 0..1."""
+    c = color.lstrip('#')
+    if len(c) == 3:
+        c = ''.join(ch * 2 for ch in c)
+    return tuple(int(c[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def _compute_hillshade(elevation, res_x, res_y, azimuth=315, exaggeration=0.4,
+                       z_factor=1.0, shadow='#3d3d3d', highlight='#ffffff',
+                       accent='#000000'):
     """
-    Compute an 8-bit hillshade array from a 2-D elevation array.
-    Uses the standard cartographic formula (same as GDAL/QGIS defaults).
-    res_x / res_y are the pixel sizes in the same units as the elevation values
+    Compute a MapLibre-GL-compatible hillshade as an (H, W, 4) uint8 RGBA array.
+
+    This mirrors the `hillshade` layer math used by the map-generator project
+    (illumination-direction 315, exaggeration 0.4, shadow #3d3d3d, highlight
+    #ffffff) so a baked SVG matches the interactive map's relief.  Unlike a
+    classic grayscale hillshade, flat terrain is fully transparent and only
+    slopes receive shadow/highlight/accent tints — so the map shows through
+    instead of being washed out by a gray sheet.
+
+    res_x / res_y are pixel sizes in the same units as the elevation values
     (metres for EPSG:3857).
     """
     import numpy as np
 
-    zenith_rad   = math.radians(90.0 - altitude)
-    # Convert geographic azimuth (CW from north) to math angle (CCW from east)
-    az_math_rad  = math.radians(360.0 - azimuth + 90.0)
+    elev = elevation.astype(np.float64)
+    # MapLibre derivative convention: +x east (axis=1), +y south (axis=0, row down)
+    gx = np.gradient(elev, res_x, axis=1) * z_factor
+    gy = np.gradient(elev, res_y, axis=0) * z_factor
 
-    dz_dx = np.gradient(elevation.astype(np.float64), res_x, axis=1)
-    dz_dy = np.gradient(elevation.astype(np.float64), res_y, axis=0)
+    slope  = np.arctan(1.25 * np.sqrt(gx ** 2 + gy ** 2))
+    aspect = np.arctan2(gy, -gx)
 
-    slope_rad  = np.arctan(z_factor * np.sqrt(dz_dx**2 + dz_dy**2))
-    aspect_rad = np.arctan2(-dz_dy, dz_dx)   # math convention (CCW from east)
+    intensity = float(exaggeration)
+    # MapLibre adds PI to the illumination direction internally.
+    az = math.radians(azimuth) + math.pi
 
-    hs = (np.cos(zenith_rad) * np.cos(slope_rad) +
-          np.sin(zenith_rad) * np.sin(slope_rad) * np.cos(az_math_rad - aspect_rad))
+    # Exponential slope scaling (verbatim from MapLibre's hillshade shader).
+    base = 1.875 - intensity * 1.75
+    max_value = 0.5 * math.pi
+    if abs(intensity - 0.5) < 1e-9:
+        scaled_slope = slope
+    else:
+        scaled_slope = ((np.power(base, slope) - 1.0) /
+                        (base ** max_value - 1.0)) * max_value
 
-    return np.clip(hs, 0.0, 1.0)
+    clamp_i = min(max(intensity * 2.0, 0.0), 1.0)
+
+    # Accent: direction-independent darkening that grows with steepness.
+    accent_rgb = np.array(_hex_to_rgb01(accent))
+    accent_a   = (1.0 - np.cos(scaled_slope)) * clamp_i          # u_accent alpha = 1
+    accent_pm  = accent_rgb[None, None, :] * accent_a[..., None]  # premultiplied
+
+    # Shade: directional blend between shadow (faces away) and highlight (faces light).
+    shade        = np.abs(np.mod((aspect + az) / math.pi + 0.5, 2.0) - 1.0)
+    shadow_rgb   = np.array(_hex_to_rgb01(shadow))
+    highlight_rgb = np.array(_hex_to_rgb01(highlight))
+    mixed = (shadow_rgb[None, None, :] * (1.0 - shade[..., None]) +
+             highlight_rgb[None, None, :] * shade[..., None])
+    shade_a  = np.sin(scaled_slope) * clamp_i
+    shade_pm = mixed * shade_a[..., None]                        # premultiplied
+
+    # Composite premultiplied: out = accent*(1 - shade.a) + shade
+    out_a      = np.clip(accent_a * (1.0 - shade_a) + shade_a, 0.0, 1.0)
+    out_rgb_pm = accent_pm * (1.0 - shade_a[..., None]) + shade_pm
+
+    # Un-premultiply to straight alpha for PNG storage.
+    a3   = out_a[..., None]
+    safe = a3 > 1e-6
+    out_rgb = np.clip(np.where(safe, out_rgb_pm / np.where(safe, a3, 1.0), 0.0), 0.0, 1.0)
+
+    rgba = np.empty(elev.shape + (4,), dtype=np.uint8)
+    rgba[..., :3] = (out_rgb * 255).round().astype(np.uint8)
+    rgba[..., 3]  = (out_a * 255).round().astype(np.uint8)
+    return rgba
 
 
 def hillshade_from_dem(dem_path, min_lon, min_lat, max_lon, max_lat,
-                       azimuth=315, altitude=45, z_factor=1.0):
+                       azimuth=315, exaggeration=0.4, z_factor=1.0):
     """
     Read a local DEM GeoTIFF (any CRS/projection), reproject to Web Mercator,
-    crop to the bbox, compute hillshade, and return (base64_png, (width, height)).
+    crop to the bbox, compute a MapLibre-compatible RGBA hillshade, and return
+    (base64_png, (width, height)).  Flat terrain is transparent; only slopes
+    are tinted, matching the map-generator project's interactive relief.
     """
     try:
         import numpy as np
@@ -364,10 +423,10 @@ def hillshade_from_dem(dem_path, min_lon, min_lat, max_lon, max_lat,
 
     print(f"  Elevation range in bbox: {elev_crop.min():.1f} – {elev_crop.max():.1f} m")
 
-    hs = _compute_hillshade(elev_crop, res_x, res_y, azimuth, altitude, z_factor)
-    hs_uint8 = (hs * 255).astype(np.uint8)
+    rgba = _compute_hillshade(elev_crop, res_x, res_y, azimuth=azimuth,
+                              exaggeration=exaggeration, z_factor=z_factor)
 
-    img = Image.fromarray(hs_uint8, mode='L').convert('RGB')
+    img = Image.fromarray(rgba, mode='RGBA')
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     b64 = base64.b64encode(buf.getvalue()).decode('ascii')
@@ -734,7 +793,7 @@ def power_tower_elements(canvas, nid, lon_lat, indent='      '):
 # ---------------------------------------------------------------------------
 
 def build_svg(data, output_path, target_width=800,
-              dem_path=None, sun_azimuth=315, sun_altitude=45,
+              dem_path=None, sun_azimuth=315, hillshade_exaggeration=0.4,
               clip_bbox=None):
     # --- Compute bounding box ---
     # If the caller supplied an explicit clip bbox, use it for the canvas and
@@ -908,7 +967,7 @@ def build_svg(data, output_path, target_width=800,
         print("Computing hillshade from DEM...")
         hs_b64, (hs_px_w, hs_px_h) = hillshade_from_dem(
             dem_path, min_lon, min_lat, max_lon, max_lat,
-            azimuth=sun_azimuth, altitude=sun_altitude,
+            azimuth=sun_azimuth, exaggeration=hillshade_exaggeration,
         )
         print(f"  Hillshade image: {hs_px_w} x {hs_px_h} px")
         open_group(lines, 'Hillshade', 'Hillshade', top_level=True)
@@ -1080,7 +1139,7 @@ Examples:
   python osm_to_ai.py --overpass query.overpassql --output mypark.svg
   python osm_to_ai.py --file mypark.osm --dem elevation.tif --output mypark.svg
   python osm_to_ai.py --file mypark.osm --fetch-dem --output mypark.svg
-  python osm_to_ai.py --file mypark.osm --fetch-dem --sun-azimuth 270 --sun-altitude 35 --output mypark.svg
+  python osm_to_ai.py --file mypark.osm --fetch-dem --sun-azimuth 270 --hillshade-exaggeration 0.5 --output mypark.svg
         """
     )
 
@@ -1103,9 +1162,11 @@ Examples:
                              f'Use 1 for lidar-quality where available, 3 for 1/9 arc-second, '
                              f'10 for 1/3 arc-second.')
     parser.add_argument('--sun-azimuth',  metavar='DEGREES', type=float, default=315,
-                        help='Sun azimuth in degrees clockwise from north (default: 315 = NW)')
-    parser.add_argument('--sun-altitude', metavar='DEGREES', type=float, default=45,
-                        help='Sun altitude above horizon in degrees (default: 45)')
+                        help='Illumination direction in degrees clockwise from north '
+                             '(default: 315 = NW, matching map-generator)')
+    parser.add_argument('--hillshade-exaggeration', metavar='FACTOR', type=float, default=0.4,
+                        help='Hillshade exaggeration/intensity, 0..1 '
+                             '(default: 0.4, matching map-generator)')
     parser.add_argument('--save-osm', metavar='PATH', default=None,
                         help='Save the downloaded OSM XML to a file for later reuse with --file')
 
@@ -1165,7 +1226,8 @@ Examples:
     # --- Build SVG ---
     print("Building SVG...")
     build_svg(data, args.output, target_width=args.width,
-              dem_path=dem_path, sun_azimuth=args.sun_azimuth, sun_altitude=args.sun_altitude,
+              dem_path=dem_path, sun_azimuth=args.sun_azimuth,
+              hillshade_exaggeration=args.hillshade_exaggeration,
               clip_bbox=user_bbox)
 
 
